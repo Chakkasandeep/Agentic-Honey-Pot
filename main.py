@@ -565,6 +565,47 @@ async def root():
         "health": "/health"
     }
 
+@app.get("/debug/env")
+async def debug_env():
+    """Debug endpoint to verify environment variables are loaded correctly"""
+    honeypot_key = os.getenv("HONEYPOT_API_KEY", "")
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    
+    return {
+        "environment_check": {
+            "honeypot_api_key_set": bool(honeypot_key),
+            "honeypot_api_key_length": len(honeypot_key),
+            "honeypot_api_key_preview": honeypot_key[:10] + "..." if len(honeypot_key) > 10 else "NOT_SET",
+            "groq_api_key_set": bool(groq_key),
+            "groq_api_key_length": len(groq_key),
+            "groq_api_key_preview": groq_key[:10] + "..." if len(groq_key) > 10 else "NOT_SET",
+            "environment": os.getenv("ENVIRONMENT", "not_set"),
+            "port": os.getenv("PORT", "not_set")
+        },
+        "instructions": "If any key shows NOT_SET or length 0, environment variables are not configured in Render dashboard"
+    }
+
+@app.get("/debug/test-auth")
+async def debug_test_auth(req: Request):
+    """Debug endpoint to test API key extraction logic"""
+    api_key, error = _get_api_key_from_request(req)
+    
+    return {
+        "api_key_found": api_key is not None,
+        "api_key_length": len(api_key) if api_key else 0,
+        "api_key_preview": api_key[:10] + "..." if api_key and len(api_key) > 10 else "NONE",
+        "expected_key_length": len(HONEYPOT_API_KEY),
+        "expected_key_preview": HONEYPOT_API_KEY[:10] + "..." if len(HONEYPOT_API_KEY) > 10 else "NOT_SET",
+        "keys_match": api_key == HONEYPOT_API_KEY if api_key else False,
+        "error_if_any": error if error else "None",
+        "headers_received": {
+            "x-api-key": req.headers.get("x-api-key", "NOT_PRESENT"),
+            "X-Api-Key": req.headers.get("X-Api-Key", "NOT_PRESENT"),
+            "Authorization": req.headers.get("Authorization", "NOT_PRESENT")[:20] + "..." if req.headers.get("Authorization") else "NOT_PRESENT"
+        }
+    }
+
+
 
 if __name__ == "__main__":
     import uvicorn
