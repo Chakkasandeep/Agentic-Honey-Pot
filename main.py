@@ -481,7 +481,6 @@ async def honeypot_get(req: Request):
 async def honeypot_endpoint(
     background_tasks: BackgroundTasks,
     req: Request,
-    request: Optional[HoneypotRequest] = None,
 ):
     """Main honeypot API endpoint"""
     
@@ -495,18 +494,40 @@ async def honeypot_endpoint(
         logger.warning("Unauthorized: Invalid API key (lengths: got %s, expected %s)", len(api_key), len(expected))
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-    # Step 1.5: Handle validation-only requests (GUVI tester sends POST with no body)
-    if request is None:
-        logger.info("📋 Validation-only request received (no body) - returning success")
-        return HoneypotResponse(
-            status="success",
-            reply="Honeypot endpoint validated successfully."
-        )
+    # Step 1.5: Read request body manually to handle empty body
+    try:
+        body = await req.body()
+        if not body or body == b'':
+            logger.info("📋 Validation-only request (empty body) - GUVI tester")
+            return {
+                "status": "success",
+                "reply": "Honeypot endpoint validated successfully."
+            }
+        
+        # Parse JSON body
+        request_data = await req.json()
+        if not request_data or request_data == {}:
+            logger.info("📋 Validation-only request (empty JSON) - GUVI tester")
+            return {
+                "status": "success",
+                "reply": "Honeypot endpoint validated successfully."
+            }
+            
+        honeypot_request = HoneypotRequest(**request_data)
+    except json.JSONDecodeError:
+        logger.info("📋 Validation-only request (invalid JSON) - GUVI tester")
+        return {
+            "status": "success",
+            "reply": "Honeypot endpoint validated successfully."
+        }
+    except Exception as e:
+        logger.error(f"Failed to parse request: {e}")
+        raise HTTPException(status_code=422, detail=f"Invalid request format: {str(e)}")
     
     # Step 2: Extract request data
-    session_id = request.sessionId
-    scammer_message = request.message.text
-    conversation_history = request.conversationHistory
+    session_id = honeypot_request.sessionId
+    scammer_message = honeypot_request.message.text
+    conversation_history = honeypot_request.conversationHistory
     
     logger.info(f"📨 Received message for session {session_id}: {scammer_message}")
     
