@@ -50,6 +50,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # API Keys - Load from environment variables
+# IMPORTANT: On Render (or your host), set HONEYPOT_API_KEY to the EXACT key you use in the GUVI tester.
+# If they don't match, the tester will show ACCESS_ERROR (401).
 HONEYPOT_API_KEY = os.getenv("HONEYPOT_API_KEY", "your-secret-honeypot-key-12345")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")  # Set this in .env file
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
@@ -453,6 +455,26 @@ def _get_api_key_from_request(request: Request) -> Tuple[Optional[str], str]:
             return key, ""
         return None, "Authorization Bearer token is empty"
     return None, "Missing x-api-key header (or Authorization: Bearer <key>)"
+
+
+@app.get("/honeypot")
+async def honeypot_get(req: Request):
+    """
+    GET /honeypot — for GUVI API Endpoint Tester.
+    The tester sends GET with x-api-key to verify endpoint is reachable and secured.
+    Returns 200 with success payload so the tester shows pass instead of ACCESS_ERROR.
+    """
+    api_key, auth_error = _get_api_key_from_request(req)
+    if api_key is None:
+        raise HTTPException(status_code=401, detail=auth_error)
+    expected = (HONEYPOT_API_KEY or "").strip()
+    if api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return {
+        "status": "success",
+        "message": "Honeypot endpoint is reachable and secured.",
+        "reply": "Endpoint validated."
+    }
 
 
 @app.post("/honeypot", response_model=HoneypotResponse)
