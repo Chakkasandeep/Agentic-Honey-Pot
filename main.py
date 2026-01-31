@@ -24,9 +24,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Agentic Honeypot API", version="1.0.0")
 
 # CORS middleware
+# CORS middleware - Allow all origins with credentials support
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex="https?://.*",  # Allow any http/https origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
