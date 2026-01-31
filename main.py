@@ -3,7 +3,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import os
 import re
 import requests
@@ -434,17 +434,41 @@ class ConversationManager:
 
 # ==================== MAIN API ENDPOINT ====================
 
+def _get_api_key_from_request(request: Request) -> Tuple[Optional[str], str]:
+    """Get API key from x-api-key or Authorization: Bearer. Returns (key_value, error_detail)."""
+    # 1. Try x-api-key (spec: x-api-key: YOUR_SECRET_API_KEY)
+    raw = request.headers.get("x-api-key") or request.headers.get("X-Api-Key")
+    if raw is not None:
+        key = (raw or "").strip()
+        if key:
+            return key, ""
+        return None, "x-api-key header is empty"
+    # 2. Fallback: Authorization: Bearer <key> (some testers send this)
+    auth = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth and auth.strip().lower().startswith("bearer "):
+        key = auth[7:].strip()
+        if key:
+            return key, ""
+        return None, "Authorization Bearer token is empty"
+    return None, "Missing x-api-key header (or Authorization: Bearer <key>)"
+
+
 @app.post("/honeypot", response_model=HoneypotResponse)
 async def honeypot_endpoint(
     request: HoneypotRequest,
     background_tasks: BackgroundTasks,
-    x_api_key: str = Header(None, alias="x-api-key")
+    req: Request,
 ):
     """Main honeypot API endpoint"""
     
-    # Step 1: Authentication
-    if x_api_key != HONEYPOT_API_KEY:
-        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
+    # Step 1: Authentication (accept x-api-key or Authorization: Bearer)
+    api_key, auth_error = _get_api_key_from_request(req)
+    if api_key is None:
+        logger.warning(f"Unauthorized: {auth_error}")
+        raise HTTPException(status_code=401, detail=auth_error)
+    expected = (HONEYPOT_API_KEY or "").strip()
+    if api_key != expected:
+        logger.warning("Unauthorized: Invalid API key (lengths: got %s, expected %s)", len(api_key), len(expected))
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     # Step 2: Extract request data
