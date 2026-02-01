@@ -315,7 +315,7 @@ class IntelligenceExtractor:
             if kw in text_lower and kw not in intelligence["suspiciousKeywords"]:
                 intelligence["suspiciousKeywords"].append(kw)
 
-        # Deduplicate
+        # Deduplicatepp
         for key in ("bankAccounts", "upiIds", "phishingLinks", "phoneNumbers", "suspiciousKeywords"):
             if key in intelligence:
                 intelligence[key] = list(dict.fromkeys(intelligence[key]))
@@ -524,6 +524,23 @@ def _get_api_key_from_request(request: Request) -> Tuple[Optional[str], str]:
     return None, "Missing x-api-key header (or Authorization: Bearer <key>)"
 
 
+@app.options("/honeypot")
+async def honeypot_options():
+    """
+    OPTIONS /honeypot — Handle CORS preflight requests from GUVI tester.
+    """
+    return JSONResponse(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "x-api-key, Content-Type, Authorization",
+            "Access-Control-Max-Age": "3600"
+        },
+        content={}
+    )
+
+
 @app.get("/honeypot")
 async def honeypot_get(req: Request):
     """
@@ -707,11 +724,11 @@ async def honeypot_endpoint(
             session
         )
     
-    # Step 8: Return response
-    return HoneypotResponse(
-        status="success",
-        reply=agent_reply
-    )
+    # Step 8: Return response (plain dict to ensure exact GUVI spec format)
+    return {
+        "status": "success",
+        "reply": agent_reply
+    }
 
 # ==================== HEALTH CHECK ENDPOINT ====================
 
