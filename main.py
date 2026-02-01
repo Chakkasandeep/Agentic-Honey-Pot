@@ -63,10 +63,12 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 sessions: Dict[str, dict] = {}
 
 # Pydantic Models with flexible configuration
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices, field_validator
+
 class Message(BaseModel):
-    sender: str
-    text: str
-    timestamp: Optional[Union[str, int]] = None  # Accept both string and int timestamps
+    sender: str = Field(validation_alias=AliasChoices("sender", "role", "from"))
+    text: str = Field(validation_alias=AliasChoices("text", "content", "body"))
+    timestamp: Optional[Union[str, int]] = None
     
     model_config = ConfigDict(populate_by_name=True)
 
@@ -86,6 +88,13 @@ class HoneypotRequest(BaseModel):
         validation_alias=AliasChoices("conversationHistory", "conversation_history")
     )
     metadata: Optional[Metadata] = None
+
+    @field_validator('conversationHistory', mode='before')
+    @classmethod
+    def parse_conversation_history(cls, v):
+        if v is None:
+            return []
+        return v
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
