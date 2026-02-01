@@ -655,8 +655,8 @@ async def honeypot_endpoint(
                 "reply": "Honeypot endpoint validated successfully."
             }
         
-        # Parse JSON body
-        request_data = await req.json()
+        # Parse JSON from body bytes (don't call req.json() after req.body())
+        request_data = json.loads(body.decode('utf-8'))
         if not request_data or request_data == {}:
             logger.info("📋 Validation-only request (empty JSON) - GUVI tester")
             return {
@@ -674,8 +674,8 @@ async def honeypot_endpoint(
             }
             
         honeypot_request = HoneypotRequest(**request_data)
-    except json.JSONDecodeError:
-        logger.info("📋 Validation-only request (invalid JSON) - GUVI tester")
+    except json.JSONDecodeError as je:
+        logger.info(f"📋 Validation-only request (invalid JSON) - GUVI tester: {str(je)}")
         return {
             "status": "success",
             "reply": "Honeypot endpoint validated successfully."
