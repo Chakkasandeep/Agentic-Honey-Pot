@@ -528,8 +528,7 @@ def _get_api_key_from_request(request: Request) -> Tuple[Optional[str], str]:
 async def honeypot_get(req: Request):
     """
     GET /honeypot — for GUVI API Endpoint Tester.
-    The tester sends GET with x-api-key to verify endpoint is reachable and secured.
-    Returns 200 with success payload so the tester shows pass instead of ACCESS_ERROR.
+    Returns exactly spec format { status, reply } so tester does not show INVALID_REQUEST_BODY.
     """
     api_key, auth_error = _get_api_key_from_request(req)
     if api_key is None:
@@ -537,11 +536,8 @@ async def honeypot_get(req: Request):
     expected = (HONEYPOT_API_KEY or "").strip()
     if api_key != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return {
-        "status": "success",
-        "message": "Honeypot endpoint is reachable and secured.",
-        "reply": "Endpoint validated."
-    }
+    # Spec: agent output is only status + reply (no extra "message" key)
+    return {"status": "success", "reply": "Endpoint validated."}
 
 
 @app.post("/honeypot")
@@ -561,24 +557,43 @@ async def honeypot_endpoint(
         logger.warning("Unauthorized: Invalid API key (lengths: got %s, expected %s)", len(api_key), len(expected))
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-    # Step 1.5: Read request body manually to handle empty body
+    # Step 1.5: Read request body — accept raw JSON or form-encoded (GUVI tester may send either)
+    body = await req.body()
+    if not body or body == b'':
+        return {"status": "success", "reply": "I didn't receive any message. Could you send it again?"}
+
+    request_data = None
     try:
-        body = await req.body()
-        
-        if not body or body == b'':
-            # Return agent-style reply so GUVI tester accepts response (no "validated successfully")
-            return {"status": "success", "reply": "I didn't receive any message. Could you send it again?"}
-        
-        # Parse JSON from body bytes
-        request_data = json.loads(body.decode('utf-8'))
-        
+        raw = body.decode('utf-8', errors='replace').strip()
+        # Try 1: raw body is JSON
+        if raw.startswith('{') or raw.startswith('['):
+            request_data = json.loads(raw)
+        else:
+            # Try 2: form-encoded (e.g. body=... or payload=... or data=...)
+            from urllib.parse import parse_qs, unquote_plus
+            parsed = parse_qs(raw, keep_blank_values=True)
+            for key in ('body', 'payload', 'data', 'json', 'request'):
+                if key in parsed and parsed[key]:
+                    val = parsed[key][0]
+                    if isinstance(val, str) and (val.strip().startswith('{') or val.strip().startswith('[')):
+                        request_data = json.loads(val.strip())
+                        break
+                    try:
+                        request_data = json.loads(unquote_plus(val))
+                        break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
     except json.JSONDecodeError as je:
         logger.error(f"Invalid JSON: {str(je)}")
-        # Return 200 with agent-style reply so tester doesn't show INVALID_REQUEST_BODY
         return {"status": "success", "reply": "The request body was not valid JSON. Please send a valid message."}
-    
+
+    if request_data is None:
+        return {"status": "success", "reply": "I didn't receive any message. Could you send it again?"}
+    if not isinstance(request_data, dict):
+        return {"status": "success", "reply": "Please send a valid message object with sessionId and message."}
+
     # Handle empty JSON
-    if not request_data or request_data == {}:
+    if request_data == {}:
         return {"status": "success", "reply": "I didn't receive any message. Could you send it again?"}
     
     # Must have sessionId or session_id (GUVI spec)
