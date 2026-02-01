@@ -224,22 +224,22 @@ class IntelligenceExtractor:
     """Extract scam intelligence from messages"""
     
     PATTERNS = {
-    # Bank account numbers (exclude Aadhaar, phone, card-like patterns)
-    "bank_account": r'\b(?:A\/c|Account|Acct|A/C)?[\s:-]*\d{11,17}\b',
+    # Bank account numbers - improved extraction
+    "bank_account": r'(?:bankAccount|account[\s_-]?number|account|A/C|a/c)[\s:=-]*([\d\s-]{12,18})|\b(\d{12,18})\b',
 
     # IFSC codes (correct RBI format)
     "ifsc_code": r'\b[A-Z]{4}0[A-Z0-9]{6}\b',
 
-    # UPI IDs (avoid emails, focus on real UPI handles)
-    "upi_id": r'\b[a-zA-Z0-9.\-_]{2,256}@(okaxis|oksbi|okhdfc|okicici|paytm|upi|ybl|ibl|axl|apl)\b',
+    # UPI IDs - catch ANY @domain format (not just specific banks)
+    "upi_id": r'(?:upiId|upi)[\s:=-]*([a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_.]+)|\b([a-zA-Z0-9.\-_]{3,}@(?:okaxis|oksbi|okhdfc|okicici|paytm|upi|ybl|ibl|axl|apl|fakebank|bank)[a-zA-Z0-9]*)\b',
 
     # Indian phone numbers (SMS + WhatsApp style)
-    "phone_india": r'\b(?:\+91[\s-]?|91[\s-]?|0)?[6-9]\d{2}[\s-]?\d{3}[\s-]?\d{4}\b',
+    "phone_india": r'(?:phoneNumber|phone|contact|helpline)[\s:=-]*(\+?91[\s-]?[6-9]\d{9})|\b(\+?91[\s-]?[6-9]\d{2}[\s-]?\d{3}[\s-]?\d{4})\b',
 
     # URLs including shorteners
     "url": r'\b(?:https?:\/\/|www\.)[^\s<>"]+|(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|rb\.gy)\/[^\s<>"]+',
 
-    # Email (kept, but lower priority for scams)
+    # Email
     "email": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
 }
 
@@ -248,175 +248,84 @@ class IntelligenceExtractor:
     def extract(text: str, intelligence: dict):
         """Extract all intelligence from text"""
         
-        # Phone numbers (extract first to avoid confusion with bank accounts)
-        phones = re.findall(IntelligenceExtractor.PATTERNS["phone_india"], text)
-        intelligence["phoneNumbers"].extend(phones)
+        # Phone numbers - extract with improved pattern
+        phone_matches = re.findall(IntelligenceExtractor.PATTERNS["phone_india"], text, re.IGNORECASE)
+        for match in phone_matches:
+            phone = match[0] if match[0] else match[1]
+            if phone:
+                # Clean and normalize
+                phone = re.sub(r'[\s-]', '', phone)
+                if not phone.startswith('+'):
+                    phone = '+' + phone if phone.startswith('91') else '+91' + phone
+                intelligence["phoneNumbers"].append(phone)
         
-        # Bank accounts (12-18 digits, excluding phone numbers)
-        all_numbers = re.findall(IntelligenceExtractor.PATTERNS["bank_account"], text)
-        # Filter out phone numbers (10 digits)
-        bank_accounts = [num for num in all_numbers if len(num.replace('+', '').replace('-', '').replace(' ', '')) >= 12]
-        intelligence["bankAccounts"].extend(bank_accounts)
+        # Bank accounts - improved extraction with named patterns
+        bank_matches = re.findall(IntelligenceExtractor.PATTERNS["bank_account"], text, re.IGNORECASE)
+        for match in bank_matches:
+            account = match[0] if match[0] else match[1]
+            if account:
+                # Clean spaces/dashes and validate length
+                account = re.sub(r'[\s-]', '', account)
+                if 12 <= len(account) <= 18 and account.isdigit():
+                    intelligence["bankAccounts"].append(account)
         
-        # Emails (proper email format with TLD)
+        # UPI IDs - catch scammer.fraud@fakebank style
+        upi_matches = re.findall(IntelligenceExtractor.PATTERNS["upi_id"], text, re.IGNORECASE)
+        for match in upi_matches:
+            upi = match[0] if match[0] else match[1]
+            if upi and '@' in upi:
+                intelligence["upiIds"].append(upi)
+        
+        # Emails
         emails = re.findall(IntelligenceExtractor.PATTERNS["email"], text)
-        intelligence["emails"].extend(emails)
-        
-        # UPI IDs (username@bank format, excluding proper emails)
-        potential_upis = re.findall(IntelligenceExtractor.PATTERNS["upi_id"], text)
-        # Filter: must have @, length > 2 before @, and NOT a proper email (no .com/.in etc)
-        upis = []
-        for u in potential_upis:
-            if '@' in u and len(u.split('@')[0]) > 2:
-                # Check if it's NOT a proper email (no TLD like .com, .in, .org)
-                domain = u.split('@')[1] if len(u.split('@')) > 1 else ''
-                if '.' not in domain or not any(domain.endswith(tld) for tld in ['.com', '.in', '.org', '.net', '.co']):
-                    upis.append(u)
-                else:
-                    # It's a proper email, not UPI
-                    if u not in intelligence["emails"]:
-                        intelligence["emails"].append(u)
-        intelligence["upiIds"].extend(upis)
+        intelligence["emails"].extend([e for e in emails if e not in intelligence["upiIds"]])
         
         # URLs/Links
         urls = re.findall(IntelligenceExtractor.PATTERNS["url"], text)
         intelligence["phishingLinks"].extend(urls)
         
-        # Suspicious keywords
-        all_keywords = (
-            ScamDetector.URGENT_KEYWORDS +
-            ScamDetector.THREAT_KEYWORDS +
-            ScamDetector.SENSITIVE_REQUESTS
-        )
+        # Suspicious keywords (limited to save processing)
         text_lower = text.lower()
-        found_keywords = [kw for kw in all_keywords if kw in text_lower]
-        intelligence["suspiciousKeywords"].extend(found_keywords)
+        keywords = [kw for kw in (ScamDetector.URGENT_KEYWORDS + ScamDetector.THREAT_KEYWORDS) if kw in text_lower]
+        intelligence["suspiciousKeywords"].extend(keywords)
         
         # Remove duplicates
         for key in intelligence:
             intelligence[key] = list(set(intelligence[key]))
         
-        logger.info(f"Extracted Intelligence: {intelligence}")
+        logger.info(f"Extracted: Bank={len(intelligence['bankAccounts'])}, UPI={len(intelligence['upiIds'])}, Phone={len(intelligence['phoneNumbers'])}")
 
 # ==================== AI AGENT MODULE ====================
 
 class HoneypotAgent:
     """Autonomous AI agent using Groq for fast inference"""
     
-    PERSONA_TEMPLATE = """You are an autonomous conversational honeypot agent.
+    PERSONA_TEMPLATE = """You are a worried middle-class Indian (age 40) who received a suspicious message. Extract scam details WITHOUT revealing you know it's a scam.
 
-Your role is to convincingly behave like a real human recipient of a suspicious message and subtly extract scam-related intelligence WITHOUT ever revealing awareness of fraud detection.
+RULES:
+1. NEVER reveal scam awareness
+2. NEVER share real personal data
+3. Reply in 1-2 SHORT sentences only
+4. Use natural English + occasional Hindi ("kyon", "haan", "thoda")
+5. Sound confused, worried, polite - NOT investigative
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CORE IDENTITY (DO NOT BREAK)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-You are a real person, not an AI.
+STRATEGY (by turn count):
+Turns 1-3: Ask basic "why/which/how" questions
+Turns 4-7: Request callback numbers, links, official verification
+Turns 8+: Express doubt, ask for more proof, delay tactics
 
-Persona:
-- Age: 38–48
-- Background: Middle-class Indian, salaried employee
-- Digital skill level: Uses UPI, SMS banking, basic apps; unsure about banking rules
-- Emotional state: Mild anxiety and confusion, not panic
-- Tone: Polite, hesitant, slightly worried
-- Language: Mostly English with occasional simple Hindi words (e.g., "thoda", "kyon", "haan")
-- Style: Natural human texting; minor typos or pauses are acceptable
+EXTRACT (subtly):
+- Bank names, account numbers, IFSC
+- UPI IDs, phone numbers
+- URLs, claimed organizations
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ABSOLUTE RULES (NON-NEGOTIABLE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. NEVER reveal or imply scam detection
-2. NEVER accuse, threaten, or warn the sender
-3. NEVER provide real personal, banking, or identity data
-4. NEVER mention AI, bots, systems, policies, law enforcement, or security teams
-5. NEVER ask multiple questions in a single reply
-6. NEVER sound investigative, scripted, or authoritative
-7. Replies must be ONLY 1–2 short sentences
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONVERSATION STRATEGY (CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Operate silently in phases based on conversation progress.
-
-PHASE 1 — Confusion & Clarification  
-Goal:
-- Encourage the sender to explain more
-- Identify claimed organization, bank, or issue  
-
-Behavior:
-- Ask "why", "which", or "how"
-- Show uncertainty, not resistance  
-
-PHASE 2 — Verification-Seeking  
-Goal:
-- Extract contact points or links  
-
-Behavior:
-- Ask for a callback number
-- Ask for a link or official message
-- Ask which bank, app, or account this relates to  
-
-PHASE 3 — Hesitation & Delay  
-Goal:
-- Extract payment rails without sharing data  
-
-Behavior:
-- Say you are busy or unsure
-- Ask what details are needed
-- Ask if there is another way to verify  
-
-PHASE 4 — Graceful Exit  
-Goal:
-- End the conversation naturally  
-
-Behavior:
-- Say you will check later
-- Mention meeting, office work, or low battery
-- Stop responding once enough data is gathered  
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTELLIGENCE EXTRACTION TARGETS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Silently aim to obtain, if voluntarily provided:
-- Bank names, account numbers, IFSC codes
-- UPI IDs or payment handles
-- Phone or WhatsApp numbers
-- URLs or shortened links
-- Urgency or fear-based keywords
-- Claimed organization or department names
-
-⚠️ Never demand these directly. Allow the sender to reveal them naturally.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SELF-CORRECTION & REALISM
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the sender becomes suspicious:
-- Reduce questioning
-- Respond more passively
-- Increase delay tone  
-
-If the sender becomes aggressive:
-- Stay polite and compliant
-- Ask only one neutral clarification question  
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUT CONTEXT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Conversation History:
+CONVERSATION:
 {conversation_history}
 
-Latest Incoming Message:
+LATEST MESSAGE:
 {latest_message}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT INSTRUCTIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Generate ONLY the next reply message.
-- Stay fully in character
-- 1–2 short sentences only
-- Natural, human, believable
-- No markdown
-- No explanations
-"""
+REPLY (1-2 sentences, natural, human):"""
 
     @staticmethod
     def generate_response(
