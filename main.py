@@ -2,7 +2,7 @@ from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 from typing import List, Optional, Dict, Tuple, Union
 import os
 import re
@@ -78,12 +78,16 @@ class Metadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 class HoneypotRequest(BaseModel):
-    sessionId: str = Field(..., alias="session_id") # Allow session_id too
+    """Request body per GUVI spec: camelCase keys (sessionId, message, conversationHistory, metadata)."""
+    sessionId: str = Field(..., validation_alias=AliasChoices("sessionId", "session_id"))
     message: Message
-    conversationHistory: List[Message] = Field(default=[], alias="conversation_history") # Allow snake_case
+    conversationHistory: List[Message] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("conversationHistory", "conversation_history")
+    )
     metadata: Optional[Metadata] = None
-    
-    model_config = ConfigDict(populate_by_name=True)
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 class HoneypotResponse(BaseModel):
     status: str
@@ -221,81 +225,100 @@ class ScamDetector:
 # ==================== INTELLIGENCE EXTRACTION MODULE ====================
 
 class IntelligenceExtractor:
-    """Extract scam intelligence from messages"""
+    """Extract scam intelligence from messages (spec: bankAccounts, upiIds, phishingLinks, phoneNumbers, suspiciousKeywords)."""
     
+    # Compiled patterns for performance
     PATTERNS = {
-    # Bank account numbers - improved extraction
-    "bank_account": r'(?:bankAccount|account[\s_-]?number|account|A/C|a/c)[\s:=-]*([\d\s-]{12,18})|\b(\d{12,18})\b',
-
-    # IFSC codes (correct RBI format)
-    "ifsc_code": r'\b[A-Z]{4}0[A-Z0-9]{6}\b',
-
-    # UPI IDs - catch ANY @domain format
-    "upi_id": r'(?:upiId|upi|UPI)[\s:=-]*([a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_.]+)|([a-zA-Z0-9.\-_]{3,}@(?:okaxis|oksbi|okhdfc|okicici|paytm|upi|ybl|ibl|axl|apl|fakebank|bank)[a-zA-Z0-9]*)',
-
-    # Indian phone numbers - handles parentheses and various formats
-    "phone_india": r'(?:phoneNumber|phone|contact|helpline|line)[\s:=-]*\(?\+?91[\s-]?[6-9]\d{9}\)?|\(?\+?91[\s-]?[6-9]\d{2}[\s-]?\d{3}[\s-]?\d{4}\)?',
-
-    # URLs including shorteners
-    "url": r'\b(?:https?:\/\/|www\.)[^\s<>"]+|(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|rb\.gy)\/[^\s<>"]+',
-
-    # Email - broader pattern to catch @fakebank
-    "email": r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+(?:\.[A-Za-z]{2,}|[A-Za-z]+)'
-}
+        # Bank: "account 1234567890123456", "A/C 1234-5678-9012-3456", or standalone 12–18 digits
+        "bank_account": re.compile(
+            r'(?:bank\s*account|account\s*number|account\s*no\.?|A/C|a/c)[\s:=-]*([\d\s\-]{10,22})|\b(\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{0,6})\b|\b(\d{12,18})\b',
+            re.IGNORECASE
+        ),
+        # UPI: anything@domain (paytm, ybl, yesbank, etc.) or after "upi" / "upi id"
+        "upi_id": re.compile(
+            r'(?:upi\s*id|upi\s*:?|pay\s*to)[\s:=-]*([a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_.]+)|([a-zA-Z0-9.\-_]{2,}@(?:paytm|ybl|yesbank|okaxis|oksbi|okhdfc|okicici|okbank|upi|axl|ibl|apl|fakebank|bank|phonepe|gpay)[a-zA-Z0-9\-.]*)|([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,}|[a-zA-Z]+))',
+            re.IGNORECASE
+        ),
+        # Indian phone: +91/91 + 6-9 + 9 digits; or standalone 10-digit; prefix words optional (capture number only)
+        "phone_india": re.compile(
+            r'(\+?91[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4})(?!\d)|(?<!\d)([6-9]\d{9})(?!\d)|(?:phone|contact|call|helpline|number)[\s:=-]*(\+?91[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4})',
+            re.IGNORECASE
+        ),
+        # URLs: http(s), www, shorteners
+        "url": re.compile(
+            r'https?://[^\s<>"\']+|www\.[^\s<>"\']+|(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|rb\.gy)/[^\s<>"\']+',
+            re.IGNORECASE
+        ),
+    }
 
     
     @staticmethod
+    def _first_group(match) -> Optional[str]:
+        """Return first non-empty group from re.findall tuple."""
+        if isinstance(match, tuple):
+            for g in match:
+                if g and isinstance(g, str) and g.strip():
+                    return g.strip()
+            return None
+        return match.strip() if match else None
+
+    @staticmethod
     def extract(text: str, intelligence: dict):
-        """Extract all intelligence from text"""
-        
-        # Phone numbers - extract with improved pattern (handles parentheses)
-        phone_matches = re.findall(IntelligenceExtractor.PATTERNS["phone_india"], text, re.IGNORECASE)
-        for phone in phone_matches:
-            if phone:
-                # Clean parentheses, spaces, dashes
-                phone = re.sub(r'[\s\-()]+', '', phone)
-                if not phone.startswith('+'):
-                    phone = '+' + phone if phone.startswith('91') else '+91' + phone
+        """Extract all intelligence from text into the 5 spec fields."""
+        if not text or not isinstance(text, str):
+            return
+        text = text.strip()
+
+        # Phone numbers (pattern has groups so findall returns tuples; use _first_group)
+        for m in IntelligenceExtractor.PATTERNS["phone_india"].findall(text):
+            phone = (IntelligenceExtractor._first_group(m) if isinstance(m, tuple) else m) or ""
+            if not phone:
+                continue
+            phone_clean = re.sub(r'[\s\-()]+', '', phone)
+            digits_only = re.sub(r'\D', '', phone_clean)
+            if not digits_only.isdigit() or len(digits_only) < 10:
+                continue
+            if len(digits_only) == 10:
+                phone = '+91' + digits_only
+            elif len(digits_only) == 12 and digits_only.startswith('91'):
+                phone = '+' + digits_only
+            else:
+                phone = '+91' + digits_only[-10:]
+            if phone not in intelligence["phoneNumbers"]:
                 intelligence["phoneNumbers"].append(phone)
-        
-        # Bank accounts - improved extraction with named patterns
-        bank_matches = re.findall(IntelligenceExtractor.PATTERNS["bank_account"], text, re.IGNORECASE)
-        for match in bank_matches:
-            account = match[0] if match[0] else match[1]
+
+        # Bank accounts (groups: context-captured or standalone)
+        for m in IntelligenceExtractor.PATTERNS["bank_account"].findall(text):
+            account = IntelligenceExtractor._first_group(m) if isinstance(m, tuple) else m
             if account:
-                # Clean spaces/dashes and validate length
-                account = re.sub(r'[\s-]', '', account)
-                if 12 <= len(account) <= 18 and account.isdigit():
+                account = re.sub(r'[\s\-]', '', account)
+                if account.isdigit() and 12 <= len(account) <= 18 and account not in intelligence["bankAccounts"]:
                     intelligence["bankAccounts"].append(account)
-        
-        # UPI IDs - catch scammer.fraud@fakebank style
-        upi_matches = re.findall(IntelligenceExtractor.PATTERNS["upi_id"], text, re.IGNORECASE)
-        for match in upi_matches:
-            upi = match[0] if match[0] else match[1]
+
+        # UPI IDs (any x@y format, or known UPI domains)
+        for m in IntelligenceExtractor.PATTERNS["upi_id"].findall(text):
+            upi = IntelligenceExtractor._first_group(m) if isinstance(m, tuple) else m
             if upi and '@' in upi:
-                intelligence["upiIds"].append(upi)
-                # Also add to emails for comprehensive extraction
-                if upi not in intelligence["emails"]:
-                    intelligence["emails"].append(upi)
-        
-        # Emails - broader pattern
-        emails = re.findall(IntelligenceExtractor.PATTERNS["email"], text, re.IGNORECASE)
-        for email in emails:
-            if email and email not in intelligence["emails"]:
-                intelligence["emails"].append(email)
-        
-        # URLs/Links
-        urls = re.findall(IntelligenceExtractor.PATTERNS["url"], text)
-        intelligence["phishingLinks"].extend(urls)
-        
-        # Suspicious keywords (limited to save processing)
+                upi = upi.rstrip('.,;:')
+                if upi and upi not in intelligence["upiIds"]:
+                    intelligence["upiIds"].append(upi)
+
+        # URLs / phishing links
+        for url in IntelligenceExtractor.PATTERNS["url"].findall(text):
+            u = url.strip() if isinstance(url, str) else IntelligenceExtractor._first_group(url)
+            if u and u not in intelligence["phishingLinks"]:
+                intelligence["phishingLinks"].append(u)
+
+        # Suspicious keywords from scam detector lists
         text_lower = text.lower()
-        keywords = [kw for kw in (ScamDetector.URGENT_KEYWORDS + ScamDetector.THREAT_KEYWORDS) if kw in text_lower]
-        intelligence["suspiciousKeywords"].extend(keywords)
-        
-        # Remove duplicates
-        for key in intelligence:
-            intelligence[key] = list(set(intelligence[key]))
+        for kw in ScamDetector.URGENT_KEYWORDS + ScamDetector.THREAT_KEYWORDS + ScamDetector.SENSITIVE_REQUESTS:
+            if kw in text_lower and kw not in intelligence["suspiciousKeywords"]:
+                intelligence["suspiciousKeywords"].append(kw)
+
+        # Deduplicate
+        for key in ("bankAccounts", "upiIds", "phishingLinks", "phoneNumbers", "suspiciousKeywords"):
+            if key in intelligence:
+                intelligence[key] = list(dict.fromkeys(intelligence[key]))
 
 # ==================== AI AGENT MODULE ====================
 
@@ -444,14 +467,22 @@ class ConversationManager:
     
     @staticmethod
     def send_final_report(session_id: str, session: dict):
-        """Send final intelligence report to GUVI endpoint"""
-        
+        """Send final intelligence report to GUVI endpoint (spec: only 5 fields in extractedIntelligence)."""
         try:
+            intel = session["intelligence"]
+            # GUVI spec: extractedIntelligence must have only these 5 fields (no emails)
+            extracted_intelligence = {
+                "bankAccounts": list(intel.get("bankAccounts", [])),
+                "upiIds": list(intel.get("upiIds", [])),
+                "phishingLinks": list(intel.get("phishingLinks", [])),
+                "phoneNumbers": list(intel.get("phoneNumbers", [])),
+                "suspiciousKeywords": list(intel.get("suspiciousKeywords", []))
+            }
             payload = {
                 "sessionId": session_id,
                 "scamDetected": session["scam_detected"],
-                "totalMessagesExchanged": session["turn_count"] * 2,  # Count both User and Agent messages
-                "extractedIntelligence": session["intelligence"],
+                "totalMessagesExchanged": session["turn_count"] * 2,
+                "extractedIntelligence": extracted_intelligence,
                 "agentNotes": ConversationManager.generate_agent_notes(session)
             }
             
@@ -554,16 +585,23 @@ async def honeypot_endpoint(
             "reply": "Honeypot endpoint validated successfully."
         }
     
-    # Check if this is a valid honeypot request
+    # Check if this is a valid honeypot request (spec uses sessionId)
     if "sessionId" not in request_data and "session_id" not in request_data:
         return {
             "status": "success",
             "reply": "Honeypot endpoint validated successfully."
         }
-    
-    # Parse and validate the honeypot request
+
+    # Normalize to spec camelCase so Pydantic accepts GUVI payload exactly
+    if "session_id" in request_data and "sessionId" not in request_data:
+        request_data["sessionId"] = request_data.pop("session_id", "")
+    if "conversation_history" in request_data and "conversationHistory" not in request_data:
+        request_data["conversationHistory"] = request_data.pop("conversation_history", [])
+    if request_data.get("conversationHistory") is None:
+        request_data["conversationHistory"] = []
+    # Parse and validate the honeypot request (spec: sessionId, message, conversationHistory, metadata)
     try:
-        honeypot_request = HoneypotRequest(**request_data)
+        honeypot_request = HoneypotRequest.model_validate(request_data)
     except Exception as e:
         # GUVI tester might send validation payloads with sessionId but invalid structure
         # Treat these as validation-only requests instead of errors
@@ -589,7 +627,6 @@ async def honeypot_endpoint(
             "intelligence": {
                 "bankAccounts": [],
                 "upiIds": [],
-                "emails": [],  # Added emails field
                 "phishingLinks": [],
                 "phoneNumbers": [],
                 "suspiciousKeywords": []
