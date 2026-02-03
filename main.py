@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from groq import Groq
 import requests
 
@@ -45,6 +45,18 @@ else:
 
 # Session storage (in production, use Redis or database)
 session_store = {}
+
+
+# ==================== CORS CONFIGURATION ====================
+
+@app.after_request
+def add_cors_headers(response):
+    """Add CORS headers to all responses"""
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, x-api-key, Authorization'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
 
 
 @dataclass
@@ -406,10 +418,36 @@ def health_check():
     }), 200
 
 
-@app.route('/honeypot', methods=['POST'])
-@require_api_key
+@app.route('/honeypot', methods=['GET', 'POST', 'OPTIONS'])
 def honeypot_endpoint():
     """Main honeypot endpoint for processing messages"""
+    
+    # Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        response = make_response('', 204)
+        return response
+    
+    # Handle GET request
+    if request.method == 'GET':
+        return jsonify({
+            "status": "success",
+            "message": "Honeypot API is operational",
+            "endpoints": {
+                "POST /honeypot": "Submit messages for scam detection",
+                "GET /honeypot": "Check API status",
+                "GET /health": "Health check"
+            }
+        }), 200
+    
+    # Handle POST request - requires API key
+    api_key = request.headers.get('x-api-key')
+    if not api_key or api_key != API_KEY:
+        logger.warning(f"Unauthorized access attempt from {request.remote_addr}")
+        return jsonify({
+            "status": "error",
+            "message": "Unauthorized. Invalid or missing API key."
+        }), 401
+    
     try:
         # Parse request
         data = request.get_json()
