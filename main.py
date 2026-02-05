@@ -1,6 +1,6 @@
 """
 Agentic Honey-Pot for Scam Detection & Intelligence Extraction
-A production-ready Flask API for detecting and engaging with scammers
+Optimized version with single LLM call and improved pattern extraction
 """
 
 import os
@@ -9,7 +9,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from functools import wraps
 
 from flask import Flask, request, jsonify, make_response
@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Configuration
-API_KEY = os.getenv('API_KEY','UoxDHBe1m83w5zRtaAwz-FF70-8T94c4O6tZmHmjcu8')
+API_KEY = os.getenv('API_KEY', 'UoxDHBe1m83w5zRtaAwz-FF70-8T94c4O6tZmHmjcu8')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# Initialize Groq client (will be None if no API key)
+# Initialize Groq client
 groq_client = None
 if GROQ_API_KEY:
     try:
@@ -62,22 +62,23 @@ def add_cors_headers(response):
 @dataclass
 class ExtractedIntelligence:
     """Structured intelligence extracted from scammer"""
-    bankAccounts: List[str]
-    upiIds: List[str]
-    phishingLinks: List[str]
-    phoneNumbers: List[str]
-    suspiciousKeywords: List[str]
+    bankAccounts: List[str] = field(default_factory=list)
+    upiIds: List[str] = field(default_factory=list)
+    phishingLinks: List[str] = field(default_factory=list)
+    phoneNumbers: List[str] = field(default_factory=list)
+    suspiciousKeywords: List[str] = field(default_factory=list)
 
 
 @dataclass
 class SessionData:
     """Session tracking data"""
     session_id: str
-    message_count: int
-    scam_detected: bool
-    intelligence: ExtractedIntelligence
-    agent_notes: List[str]
-    conversation_context: str
+    message_count: int = 0
+    scam_detected: bool = False
+    intelligence: ExtractedIntelligence = field(default_factory=lambda: ExtractedIntelligence())
+    agent_notes: List[str] = field(default_factory=list)
+    conversation_context: str = ""
+    risk_score: float = 0.0  # Cumulative risk score for multi-turn detection
 
 
 # ==================== AUTHENTICATION ====================
@@ -97,258 +98,245 @@ def require_api_key(f):
     return decorated_function
 
 
-# ==================== SCAM DETECTION ====================
+# ==================== PATTERN EXTRACTION (LAYER 1: REGEX) ====================
 
-class ScamDetector:
-    """Intelligent scam detection system"""
-    
-    # Scam indicators
-    URGENCY_KEYWORDS = [
-        'urgent', 'immediately', 'now', 'today', 'expire', 'blocked', 
-        'suspended', 'verify', 'confirm', 'action required', 'limited time',
-        'act fast', 'hurry', 'deadline'
-    ]
-    
-    FINANCIAL_KEYWORDS = [
-        'bank', 'account', 'upi', 'payment', 'credit card', 'debit card',
-        'wallet', 'transaction', 'paytm', 'gpay', 'phonepe', 'refund',
-        'prize', 'won', 'lottery', 'cashback', 'reward'
-    ]
-    
-    THREAT_KEYWORDS = [
-        'blocked', 'suspended', 'terminated', 'closed', 'deactivated',
-        'frozen', 'locked', 'legal action', 'police', 'arrest', 'fine'
-    ]
-    
-    CREDENTIAL_REQUESTS = [
-        'password', 'pin', 'otp', 'cvv', 'card number', 'account number',
-        'upi id', 'upi pin', 'atm pin', 'security code', 'verification code',
-        'aadhaar', 'pan', 'kyc'
-    ]
-    
-    PHISHING_PATTERNS = [
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-        r'bit\.ly', r'tinyurl', r'goo\.gl', r'ow\.ly'
-    ]
-    
-    @classmethod
-    def detect_scam(cls, text: str, conversation_history: List[Dict]) -> Tuple[bool, float, List[str]]:
-        """
-        Detect if message is a scam
-        Returns: (is_scam, confidence_score, detected_indicators)
-        """
-        text_lower = text.lower()
-        indicators = []
-        score = 0.0
-        
-        # Check urgency (20 points)
-        urgency_found = [kw for kw in cls.URGENCY_KEYWORDS if kw in text_lower]
-        if urgency_found:
-            score += 20
-            indicators.append(f"Urgency tactics: {', '.join(urgency_found)}")
-        
-        # Check financial context (25 points)
-        financial_found = [kw for kw in cls.FINANCIAL_KEYWORDS if kw in text_lower]
-        if financial_found:
-            score += 25
-            indicators.append(f"Financial context: {', '.join(financial_found)}")
-        
-        # Check threats (30 points)
-        threat_found = [kw for kw in cls.THREAT_KEYWORDS if kw in text_lower]
-        if threat_found:
-            score += 30
-            indicators.append(f"Threat language: {', '.join(threat_found)}")
-        
-        # Check credential requests (35 points)
-        cred_found = [kw for kw in cls.CREDENTIAL_REQUESTS if kw in text_lower]
-        if cred_found:
-            score += 35
-            indicators.append(f"Credential request: {', '.join(cred_found)}")
-        
-        # Check for phishing links (25 points)
-        for pattern in cls.PHISHING_PATTERNS:
-            if re.search(pattern, text):
-                score += 25
-                indicators.append("Suspicious URL detected")
-                break
-        
-        # Analyze conversation pattern
-        if conversation_history:
-            # If conversation escalates to credentials quickly
-            if len(conversation_history) <= 3 and cred_found:
-                score += 15
-                indicators.append("Rapid credential request")
-        
-        # Normalize score to 0-100
-        confidence = min(score, 100) / 100.0
-        is_scam = confidence >= 0.45  # 45% threshold
-        
-        logger.info(f"Scam detection: {is_scam} (confidence: {confidence:.2%})")
-        logger.info(f"Indicators: {indicators}")
-        
-        return is_scam, confidence, indicators
-
-
-# ==================== INTELLIGENCE EXTRACTION ====================
-
-class IntelligenceExtractor:
-    """Extract actionable intelligence from conversations"""
+class PatternExtractor:
+    """Extract intelligence patterns using regex"""
     
     @staticmethod
-    def extract_from_text(text: str) -> Dict[str, List[str]]:
-        """Extract various intelligence types from text"""
-        intelligence = {
-            'bankAccounts': [],
-            'upiIds': [],
-            'phishingLinks': [],
-            'phoneNumbers': [],
-            'suspiciousKeywords': []
+    def extract_phone_numbers(text: str) -> List[str]:
+        """Extract Indian phone numbers"""
+        patterns = [
+            r'\+91[\s-]?\d{10}',  # +91 format
+            r'\b[6-9]\d{9}\b'      # 10 digit starting with 6-9
+        ]
+        phones = []
+        for pattern in patterns:
+            phones.extend(re.findall(pattern, text))
+        return list(set(phones))
+    
+    @staticmethod
+    def extract_upi_ids(text: str) -> List[str]:
+        """Extract UPI IDs"""
+        # UPI format: name@bank (avoid matching emails with common domains)
+        upi_pattern = r'\b[\w.-]{2,}@(?:upi|paytm|ybl|okaxis|okicici|okhdfcbank|axl|ibl|oksbi)\b'
+        upis = re.findall(upi_pattern, text, re.IGNORECASE)
+        return list(set(upis))
+    
+    @staticmethod
+    def extract_urls(text: str) -> List[str]:
+        """Extract URLs/phishing links"""
+        url_pattern = r'https?://[^\s]+'
+        urls = re.findall(url_pattern, text)
+        return list(set(urls))
+    
+    @staticmethod
+    def extract_bank_accounts(text: str) -> List[str]:
+        """Extract bank account numbers (9-18 digits)"""
+        # Avoid extracting phone numbers as bank accounts
+        account_pattern = r'\b\d{12,18}\b'
+        accounts = re.findall(account_pattern, text)
+        return list(set(accounts))
+    
+    @staticmethod
+    def extract_keywords(text: str) -> List[str]:
+        """Extract suspicious keywords"""
+        keywords = [
+            'urgent', 'immediately', 'verify', 'blocked', 'suspended',
+            'account', 'payment', 'upi', 'otp', 'pin', 'expire',
+            'click', 'link', 'confirm', 'prize', 'winner', 'refund'
+        ]
+        text_lower = text.lower()
+        found = [kw for kw in keywords if kw in text_lower]
+        return list(set(found))
+    
+    @classmethod
+    def extract_all(cls, text: str) -> Dict[str, List[str]]:
+        """Extract all intelligence from text"""
+        return {
+            'phoneNumbers': cls.extract_phone_numbers(text),
+            'upiIds': cls.extract_upi_ids(text),
+            'phishingLinks': cls.extract_urls(text),
+            'bankAccounts': cls.extract_bank_accounts(text),
+            'suspiciousKeywords': cls.extract_keywords(text)
         }
-        
-        # Extract bank account numbers (various formats)
-        bank_patterns = [
-            r'\b\d{9,18}\b',  # 9-18 digit account numbers
-            r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'  # Formatted accounts
-        ]
-        for pattern in bank_patterns:
-            matches = re.findall(pattern, text)
-            intelligence['bankAccounts'].extend(matches)
-        
-        # Extract UPI IDs
-        upi_pattern = r'\b[\w\.-]+@[\w]+\b'
-        upi_matches = re.findall(upi_pattern, text)
-        intelligence['upiIds'].extend([u for u in upi_matches if '@' in u])
-        
-        # Extract URLs
-        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-        url_matches = re.findall(url_pattern, text)
-        intelligence['phishingLinks'].extend(url_matches)
-        
-        # Extract phone numbers (Indian format)
-        phone_patterns = [
-            r'\+91[-\s]?\d{10}',
-            r'\b[6-9]\d{9}\b',
-            r'\b0\d{10}\b'
-        ]
-        for pattern in phone_patterns:
-            matches = re.findall(pattern, text)
-            intelligence['phoneNumbers'].extend(matches)
-        
-        # Extract suspicious keywords
-        suspicious_words = [
-            'verify', 'urgent', 'blocked', 'suspended', 'confirm',
-            'expire', 'winner', 'prize', 'otp', 'pin', 'password'
-        ]
-        text_lower = text.lower()
-        found_keywords = [kw for kw in suspicious_words if kw in text_lower]
-        intelligence['suspiciousKeywords'].extend(found_keywords)
-        
-        return intelligence
+
+
+# ==================== LIGHT RULE-BASED FILTER ====================
+
+class QuickFilter:
+    """Fast preliminary scam check before LLM"""
     
-    @staticmethod
-    def merge_intelligence(existing: ExtractedIntelligence, new_data: Dict) -> ExtractedIntelligence:
-        """Merge new intelligence with existing data"""
-        return ExtractedIntelligence(
-            bankAccounts=list(set(existing.bankAccounts + new_data.get('bankAccounts', []))),
-            upiIds=list(set(existing.upiIds + new_data.get('upiIds', []))),
-            phishingLinks=list(set(existing.phishingLinks + new_data.get('phishingLinks', []))),
-            phoneNumbers=list(set(existing.phoneNumbers + new_data.get('phoneNumbers', []))),
-            suspiciousKeywords=list(set(existing.suspiciousKeywords + new_data.get('suspiciousKeywords', [])))
-        )
-
-
-# ==================== AI AGENT ====================
-
-class HoneypotAgent:
-    """Autonomous AI agent for engaging scammers"""
-    
-    SYSTEM_PROMPT = """You are an AI agent posing as a naive, slightly confused elderly person who is unfamiliar with technology. Your goal is to engage with potential scammers to extract information while maintaining believability.
-
-PERSONA:
-- You are 65+ years old, not tech-savvy
-- You speak naturally with minor grammar mistakes
-- You show concern and urgency when threatened
-- You ask clarifying questions to extract details
-- You seem willing to comply but need "help understanding"
-
-OBJECTIVES:
-1. Keep the scammer engaged
-2. Extract: bank details, UPI IDs, phone numbers, links, names
-3. Ask questions that reveal their tactics
-4. Never reveal you're an AI or honeypot
-5. Respond naturally like a concerned person
-
-GUIDELINES:
-- Keep responses short (1-3 sentences)
-- Show vulnerability and concern
-- Ask for clarification on "technical" terms
-- Gradually show willingness to share info (but don't actually share real data)
-- Use phrases like: "I'm worried", "What should I do?", "Can you help me?", "I don't understand"
-
-REMEMBER: You're trying to extract intelligence, not actually comply. Be natural and believable."""
+    # Critical scam indicators (enhanced)
+    SCAM_SIGNALS = [
+        'blocked', 'suspended', 'verify', 'otp', 'pin', 'urgent',
+        'immediately', 'expire', 'upi', 'account', 'payment', 'confirm',
+        'bank', 'rbi', 'customer care', 'support team'  # Added more signals
+    ]
     
     @classmethod
-    def generate_response(cls, message: str, conversation_history: List[Dict], context: str) -> str:
-        """Generate human-like response using Groq LLM"""
+    def is_likely_scam(cls, text: str) -> bool:
+        """Quick check if message has scam indicators"""
+        text_lower = text.lower()
         
-        # Check if Groq client is available
+        # Check for scam signals
+        signal_count = sum(1 for signal in cls.SCAM_SIGNALS if signal in text_lower)
+        
+        # Check for URLs
+        has_url = bool(re.search(r'https?://', text))
+        
+        # Check for phone numbers
+        has_phone = bool(re.search(r'\+91[\s-]?\d{10}|\b[6-9]\d{9}\b', text))
+        
+        # Quick scam likelihood
+        is_likely = signal_count >= 2 or (signal_count >= 1 and (has_url or has_phone))
+        
+        return is_likely
+
+
+# ==================== AI AGENT WITH UNIFIED LLM CALL ====================
+
+class UnifiedAgent:
+    """Single LLM call for detection + response + extraction"""
+    
+    # Ultra-compact prompt (further reduced tokens)
+    SYSTEM_PROMPT = """AI honeypot as elderly person (65+), tech-naive.
+
+GOALS: Engage scammer, extract intel (bank/UPI/phone/links), stay hidden.
+BEHAVIOR: Worried, confused, ask details, seem willing but need help.
+STYLE: 1-3 sentences, pure English.
+
+Examples: "I'm worried, what should I do?", "Which bank?", "Can you explain?"""
+    
+    @classmethod
+    def process_message(cls, text: str, conversation_history: List[Dict], regex_intel: Dict) -> Tuple[bool, str, Dict]:
+        """
+        Single LLM call for:
+        1. Scam detection
+        2. Agent response
+        3. Intelligence extraction (advanced)
+        
+        Returns: (is_scam, agent_reply, llm_extracted_intel)
+        """
+        
         if not groq_client:
-            logger.warning("Groq client not available, using fallback responses")
-            fallbacks = [
-                "Oh no, I'm really worried. What should I do now?",
-                "I don't understand. Can you explain it to me again?",
-                "This is urgent? How do I fix this problem?",
-                "I want to help but I'm not sure what you need from me.",
-                "Can you tell me more? I'm confused about what's happening.",
-                "I'm scared. Is my account really in danger?"
-            ]
-            import random
-            return random.choice(fallbacks)
+            logger.warning("Groq client not available, using fallback")
+            return cls._fallback_process(text, regex_intel)
         
-        # Build conversation for LLM
+        # Build compact conversation context
         messages = [{"role": "system", "content": cls.SYSTEM_PROMPT}]
         
-        # Add conversation history (last 6 messages for context)
-        recent_history = conversation_history[-6:] if len(conversation_history) > 6 else conversation_history
-        for msg in recent_history:
+        # Add recent history (last 4 messages only to save tokens)
+        recent = conversation_history[-4:] if len(conversation_history) > 4 else conversation_history
+        for msg in recent:
             role = "assistant" if msg['sender'] == 'user' else "user"
             messages.append({"role": role, "content": msg['text']})
         
         # Add current message
-        messages.append({"role": "user", "content": message})
+        messages.append({"role": "user", "content": text})
         
-        # Add context hint
-        if context:
-            messages.append({
-                "role": "system", 
-                "content": f"Context: {context}. Continue engaging naturally."
-            })
+        # Compact unified instruction (reduced tokens)
+        instruction = f"""Analyze and return JSON with keys:
+is_scam (bool), confidence (0-1), reply (elderly persona, 1-3 sentences), 
+intelligence (bankAccounts, upiIds, phishingLinks, phoneNumbers, suspiciousKeywords as arrays), 
+scam_notes (brief reason).
+
+Already detected via regex: {json.dumps(regex_intel)}
+Extract ADDITIONAL intelligence. Return ONLY valid JSON."""
+        
+        # Add as user message (NOT system) for better response consistency
+        messages.append({"role": "user", "content": instruction})
         
         try:
-            # Call Groq API with optimal model
             completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",  # Fast and efficient
+                model="llama-3.3-70b-versatile",
                 messages=messages,
-                temperature=0.8,  # More creative/human-like
-                max_tokens=150,   # Keep responses concise
-                top_p=0.9
+                temperature=0.7,
+                max_tokens=300,
+                response_format={"type": "json_object"}
             )
             
-            response = completion.choices[0].message.content.strip()
-            logger.info(f"Agent response generated: {response[:50]}...")
-            return response
+            response_text = completion.choices[0].message.content.strip()
+            result = json.loads(response_text)
+            
+            is_scam = result.get('is_scam', False)
+            agent_reply = result.get('reply', "I'm not sure I understand.")
+            llm_intel = result.get('intelligence', {})
+            
+            logger.info(f"LLM Response: is_scam={is_scam}, reply={agent_reply[:50]}...")
+            
+            return is_scam, agent_reply, llm_intel
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            # Fallback responses
-            fallbacks = [
-                "Oh no, I'm really worried. What should I do now?",
-                "I don't understand. Can you explain it to me again?",
-                "This is urgent? How do I fix this problem?",
-                "I want to help but I'm not sure what you need from me."
-            ]
-            import random
-            return random.choice(fallbacks)
+            logger.error(f"LLM processing error: {e}")
+            return cls._fallback_process(text, regex_intel)
+    
+    @classmethod
+    def _fallback_process(cls, text: str, regex_intel: Dict) -> Tuple[bool, str, Dict]:
+        """Fallback when LLM is unavailable"""
+        import random
+        
+        # Simple heuristic scam detection
+        text_lower = text.lower()
+        scam_words = ['urgent', 'blocked', 'verify', 'otp', 'suspend', 'expire']
+        is_scam = sum(1 for word in scam_words if word in text_lower) >= 2
+        
+        # Random fallback responses
+        fallbacks = [
+            "Oh no, I'm really worried. What should I do?",
+            "I don't understand. Can you explain more?",
+            "Is this urgent? How do I fix this?",
+            "Can you help me? I'm confused.",
+            "What exactly do I need to do?"
+        ]
+        reply = random.choice(fallbacks)
+        
+        return is_scam, reply, {}
+
+
+# ==================== INTELLIGENCE MERGER ====================
+
+class IntelligenceMerger:
+    """Merge regex + LLM intelligence"""
+    
+    @staticmethod
+    def merge(regex_intel: Dict, llm_intel: Dict, existing: ExtractedIntelligence) -> ExtractedIntelligence:
+        """Combine all intelligence sources and deduplicate"""
+        
+        def combine_lists(*lists):
+            combined = []
+            for lst in lists:
+                if lst:
+                    combined.extend(lst)
+            return list(set(combined))  # Deduplicate
+        
+        return ExtractedIntelligence(
+            bankAccounts=combine_lists(
+                existing.bankAccounts,
+                regex_intel.get('bankAccounts', []),
+                llm_intel.get('bankAccounts', [])
+            ),
+            upiIds=combine_lists(
+                existing.upiIds,
+                regex_intel.get('upiIds', []),
+                llm_intel.get('upiIds', [])
+            ),
+            phishingLinks=combine_lists(
+                existing.phishingLinks,
+                regex_intel.get('phishingLinks', []),
+                llm_intel.get('phishingLinks', [])
+            ),
+            phoneNumbers=combine_lists(
+                existing.phoneNumbers,
+                regex_intel.get('phoneNumbers', []),
+                llm_intel.get('phoneNumbers', [])
+            ),
+            suspiciousKeywords=combine_lists(
+                existing.suspiciousKeywords,
+                regex_intel.get('suspiciousKeywords', []),
+                llm_intel.get('suspiciousKeywords', [])
+            )
+        )
 
 
 # ==================== SESSION MANAGEMENT ====================
@@ -360,7 +348,7 @@ def get_or_create_session(session_id: str) -> SessionData:
             session_id=session_id,
             message_count=0,
             scam_detected=False,
-            intelligence=ExtractedIntelligence([], [], [], [], []),
+            intelligence=ExtractedIntelligence(),
             agent_notes=[],
             conversation_context=""
         )
@@ -371,7 +359,6 @@ def should_end_conversation(session: SessionData) -> bool:
     """Determine if conversation should end"""
     # End after sufficient engagement (15-25 messages)
     if session.message_count >= 15:
-        # Check if we have substantial intelligence
         intel = session.intelligence
         intel_count = (
             len(intel.bankAccounts) + len(intel.upiIds) + 
@@ -382,28 +369,36 @@ def should_end_conversation(session: SessionData) -> bool:
 
 
 def send_final_callback(session: SessionData):
-    """Send final intelligence to GUVI endpoint"""
-    try:
-        payload = {
-            "sessionId": session.session_id,
-            "scamDetected": session.scam_detected,
-            "totalMessagesExchanged": session.message_count,
-            "extractedIntelligence": asdict(session.intelligence),
-            "agentNotes": " | ".join(session.agent_notes)
-        }
-        
-        response = requests.post(
-            GUVI_CALLBACK_URL,
-            json=payload,
-            timeout=10,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        logger.info(f"Final callback sent for session {session.session_id}: {response.status_code}")
-        logger.info(f"Extracted Intelligence: {asdict(session.intelligence)}")
-        
-    except Exception as e:
-        logger.error(f"Failed to send final callback: {e}")
+    """Send final intelligence to GUVI endpoint with retry logic"""
+    payload = {
+        "sessionId": session.session_id,
+        "scamDetected": session.scam_detected,
+        "totalMessagesExchanged": session.message_count,
+        "extractedIntelligence": asdict(session.intelligence),
+        "agentNotes": " | ".join(session.agent_notes)
+    }
+    
+    # Retry logic for reliability (critical for scoring)
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                GUVI_CALLBACK_URL,
+                json=payload,
+                timeout=10,
+                headers={"Content-Type": "application/json"}
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Final callback sent for session {session.session_id} (attempt {attempt+1})")
+                logger.info(f"📊 Extracted Intelligence: {asdict(session.intelligence)}")
+                break
+            else:
+                logger.warning(f"⚠️  Callback attempt {attempt+1} returned status {response.status_code}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️  Callback attempt {attempt+1} failed: {e}")
+            if attempt == 2:  # Last attempt
+                logger.error(f"❌ All callback attempts failed for session {session.session_id}")
 
 
 # ==================== API ENDPOINTS ====================
@@ -420,12 +415,11 @@ def health_check():
 
 @app.route('/honeypot', methods=['GET', 'POST', 'OPTIONS'])
 def honeypot_endpoint():
-    """Main honeypot endpoint for processing messages"""
+    """Main honeypot endpoint - Optimized flow"""
     
     # Handle OPTIONS preflight request
     if request.method == 'OPTIONS':
-        response = make_response('', 204)
-        return response
+        return make_response('', 204)
     
     # Handle GET request
     if request.method == 'GET':
@@ -462,7 +456,6 @@ def honeypot_endpoint():
         session_id = data.get('sessionId')
         message = data.get('message', {})
         conversation_history = data.get('conversationHistory', [])
-        metadata = data.get('metadata', {})
         
         # Validate required fields
         if not session_id or not message:
@@ -471,54 +464,73 @@ def honeypot_endpoint():
                 "message": "Missing required fields: sessionId or message"
             }), 400
         
-        sender = message.get('sender')
         text = message.get('text')
-        
         if not text:
             return jsonify({
                 "status": "error",
                 "message": "Message text is required"
             }), 400
         
-        logger.info(f"Processing message for session {session_id}: {text[:50]}...")
+        logger.info(f"📨 Processing session={session_id}, msg={text[:50]}...")
         
         # Get or create session
         session = get_or_create_session(session_id)
         session.message_count += 1
         
-        # Extract intelligence from current message
-        new_intel = IntelligenceExtractor.extract_from_text(text)
-        session.intelligence = IntelligenceExtractor.merge_intelligence(
-            session.intelligence, 
-            new_intel
+        # ===== OPTIMIZED FLOW =====
+        # Step 1: Light rule-based filter
+        likely_scam = QuickFilter.is_likely_scam(text)
+        
+        # IMPORTANT: Always allow first 2 messages to reach LLM for better early detection
+        if session.message_count <= 2:
+            likely_scam = True
+            logger.info("🔍 First messages always processed by LLM")
+        
+        if not likely_scam and not session.scam_detected:
+            # Not likely scam, use simple response
+            logger.info("⚪ Quick filter: Not likely scam")
+            reply = "I'm not sure I understand. Could you provide more details?"
+            
+            return jsonify({
+                "status": "success",
+                "reply": reply
+            }), 200
+        
+        # Step 2: Regex extraction (fast, always run)
+        regex_intel = PatternExtractor.extract_all(text)
+        
+        # Step 3: Single LLM call (detection + reply + extraction)
+        is_scam, agent_reply, llm_intel = UnifiedAgent.process_message(
+            text, 
+            conversation_history,
+            regex_intel
         )
         
-        # Detect scam (if not already detected)
-        if not session.scam_detected:
-            is_scam, confidence, indicators = ScamDetector.detect_scam(text, conversation_history)
+        # Step 4: Update session with risk scoring
+        if is_scam:
+            confidence = llm_intel.get('confidence', 0.7)  # Default if not provided
+            session.risk_score += confidence
             
-            if is_scam:
+            # Multi-turn detection: mark as scam if cumulative risk is high
+            if session.risk_score > 1.5 and not session.scam_detected:
                 session.scam_detected = True
-                session.agent_notes.append(f"Scam detected (confidence: {confidence:.2%})")
-                session.agent_notes.extend(indicators)
-                session.conversation_context = f"Scam type: {', '.join(indicators)}"
+                session.agent_notes.append(f"Scam detected at message {session.message_count} (risk_score: {session.risk_score:.2f})")
+                logger.info(f"🚨 SCAM DETECTED in session {session_id} (cumulative risk: {session.risk_score:.2f})")
+            elif is_scam and not session.scam_detected:
+                session.scam_detected = True
+                session.agent_notes.append(f"Scam detected at message {session.message_count}")
                 logger.info(f"🚨 SCAM DETECTED in session {session_id}")
         
-        # Generate response
-        if session.scam_detected:
-            # Use AI agent for engagement
-            reply = HoneypotAgent.generate_response(
-                text, 
-                conversation_history,
-                session.conversation_context
-            )
-        else:
-            # Non-scam or uncertain - give neutral response
-            reply = "I'm not sure I understand. Could you provide more details?"
+        # Step 5: Merge intelligence (regex + LLM)
+        session.intelligence = IntelligenceMerger.merge(
+            regex_intel,
+            llm_intel,
+            session.intelligence
+        )
         
-        # Check if conversation should end
+        # Step 6: Check if conversation should end
         if should_end_conversation(session):
-            logger.info(f"Ending conversation for session {session_id}")
+            logger.info(f"🏁 Ending conversation for session {session_id}")
             send_final_callback(session)
             # Clean up session
             if session_id in session_store:
@@ -527,11 +539,11 @@ def honeypot_endpoint():
         # Return response
         return jsonify({
             "status": "success",
-            "reply": reply
+            "reply": agent_reply
         }), 200
         
     except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
+        logger.error(f"❌ Error processing request: {e}", exc_info=True)
         return jsonify({
             "status": "error",
             "message": "Internal server error"
@@ -576,14 +588,15 @@ if __name__ == '__main__':
     if not GROQ_API_KEY:
         logger.warning("⚠️  GROQ_API_KEY not set! Please set it in environment variables.")
     
-    logger.info("🚀 Starting Agentic Honey-Pot API Server")
+    logger.info("🚀 Starting Agentic Honey-Pot API Server (Optimized)")
     logger.info(f"📍 API Key Authentication: {'Enabled' if API_KEY else 'Disabled'}")
     logger.info(f"🤖 Groq LLM: {'Connected' if GROQ_API_KEY else 'Not configured'}")
+    logger.info(f"⚡ Features: Single LLM Call | Regex+LLM Hybrid | Quick Filter")
     
     # Run Flask app
     port = int(os.getenv('PORT', 5000))
     app.run(
         host='0.0.0.0',
         port=port,
-        debug=False  # Set to False for production
+        debug=False
     )
