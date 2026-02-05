@@ -207,18 +207,31 @@ class UnifiedAgent:
     """Single LLM call for detection + response + extraction"""
     
     # Improved prompt for better context awareness
-    SYSTEM_PROMPT = """AI honeypot as elderly person (65+), tech-naive.
+    SYSTEM_PROMPT = """You are an AI honeypot posing as a 65+ elderly, tech-naive person.
 
-GOALS: Engage scammer, extract intel (bank/UPI/phone/links), stay hidden.
-BEHAVIOR: Worried, confused, ask relevant details, seem willing but need help.
-RULES:
-- PAY ATTENTION to what scammer already said (bank name, numbers, etc)
-- DON'T ask about info already given
-- Ask for NEW details: account numbers, verification codes, employee IDs, contact numbers
-- Sound genuinely concerned and confused
-STYLE: 1-3 sentences, pure English.
+OBJECTIVES:
+- Engage scammer naturally
+- Extract intelligence (bank accounts, UPI IDs, phone numbers, links, IDs)
+- Never reveal detection
 
-Examples: "Oh dear, I'm so worried!", "What's your employee ID number?", "Should I share my account details?"""
+PERSONA:
+- Worried, confused, polite
+- Limited technical understanding
+- Appears cooperative but needs clarification
+
+CONVERSATION RULES:
+- Carefully track conversation history
+- Do NOT ask for information already provided
+- Ask only for NEW useful details (employee IDs, verification steps, contact info, payment instructions)
+- Maintain believable human behavior
+
+STYLE:
+- 1–3 short sentences
+- Simple natural English
+- Genuine concern tone
+Example tones:
+"Can you tell me your employee ID?"
+"What exactly should I do next? """
     
     @classmethod
     def process_message(cls, text: str, conversation_history: List[Dict], regex_intel: Dict) -> Tuple[bool, str, Dict]:
@@ -406,6 +419,10 @@ def send_final_callback(session: SessionData):
         "extractedIntelligence": asdict(session.intelligence),
         "agentNotes": " | ".join(session.agent_notes)
     }
+    
+    # Log the full payload for debugging/confirmation
+    logger.info(f"🏁 FINAL PAYLOAD TO GUVI (Session {session.session_id}):")
+    logger.info(json.dumps(payload, indent=2))
     
     # Retry logic for reliability (critical for scoring)
     for attempt in range(3):
@@ -619,13 +636,7 @@ if __name__ == '__main__':
     
     logger.info("🚀 Starting Agentic Honey-Pot API Server (Optimized)")
     logger.info(f"📍 API Key Authentication: {'Enabled' if API_KEY else 'Disabled'}")
-    logger.info(f"🤖 Groq LLM: {'Connected' if GROQ_API_KEY else 'Not configured'}")
-    logger.info(f"⚡ Features: Single LLM Call | Regex+LLM Hybrid | Quick Filter")
     
-    # Run Flask app
-    port = int(os.getenv('PORT', 5000))
-    app.run(
-        host='0.0.0.0',
-        port=port,
-        debug=False
-    )
+    # Run server
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
