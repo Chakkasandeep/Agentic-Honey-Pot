@@ -197,6 +197,8 @@ def agent_reply(msg, history, session):
 
         reply=result.get("reply") or random.choice(FALLBACKS)
         intel=result.get("intelligence",{})
+        if not isinstance(intel, dict):
+            intel = {}
 
         return reply,intel
 
@@ -214,7 +216,8 @@ def merge(existing,*sources):
     def combine(k):
         data=set(getattr(existing,k))
         for s in sources:
-            data.update(s.get(k,[]))
+            if isinstance(s, dict):
+                data.update(s.get(k,[]))
         return list(data)
 
     return Intelligence(**{k:combine(k) for k in asdict(existing)})
