@@ -206,14 +206,19 @@ class QuickFilter:
 class UnifiedAgent:
     """Single LLM call for detection + response + extraction"""
     
-    # Ultra-compact prompt (further reduced tokens)
+    # Improved prompt for better context awareness
     SYSTEM_PROMPT = """AI honeypot as elderly person (65+), tech-naive.
 
 GOALS: Engage scammer, extract intel (bank/UPI/phone/links), stay hidden.
-BEHAVIOR: Worried, confused, ask details, seem willing but need help.
+BEHAVIOR: Worried, confused, ask relevant details, seem willing but need help.
+RULES:
+- PAY ATTENTION to what scammer already said (bank name, numbers, etc)
+- DON'T ask about info already given
+- Ask for NEW details: account numbers, verification codes, employee IDs, contact numbers
+- Sound genuinely concerned and confused
 STYLE: 1-3 sentences, pure English.
 
-Examples: "I'm worried, what should I do?", "Which bank?", "Can you explain?"""
+Examples: "Oh dear, I'm so worried!", "What's your employee ID number?", "Should I share my account details?"""
     
     @classmethod
     def process_message(cls, text: str, conversation_history: List[Dict], regex_intel: Dict) -> Tuple[bool, str, Dict]:
